@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "internship-cli"
+version = "0.1.0"
+description = "Scrape LinkedIn job search results from your own logged-in browser session."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["linkedin", "jobs", "internships", "scraper", "playwright", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "playwright>=1.40",
+    "click>=8.1",
+]
+
+[project.scripts]
+internship-radar = "internship_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourname/internship-cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["internship_cli"]
