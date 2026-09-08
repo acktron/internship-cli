@@ -1,0 +1,47 @@
+(function listenImgEvents() {
+              document.addEventListener('load', ({ target }) => {
+                // This checks for image load events so we can know if they're ready to be displayed
+                if (target.tagName === 'IMG') {
+                  target.setAttribute('data-loaded', true);
+                }
+              }, true);
+              // Capture errors so the LIX-gated "instant paint" path can hide
+              // failed priority images and let the SVG fallback surface.
+              document.addEventListener('error', ({ target }) => {
+                if (target.tagName === 'IMG') {
+                  target.setAttribute('data-error', 'true');
+                }
+              }, true);
+             })()
+
+=====
+
+window.__como_module_cache__ = new Map();
+              window.__missing_como_module_list__=[];
+              
+  window.addEventListener('load', () => {
+    if (window.__missing_como_module_list__ && window.__missing_como_module_list__.length > 0) {
+      window.__missing_como_module_list__.forEach((id) => {
+        Promise.reject(new Error('Missing como module: ' + id));
+      });
+      window.__missing_como_module_list__ = [];
+    }
+  }, false);
+
+              window.__como_chunks__ = window.__como_chunks__ || [];
+              window.__como_initial_hydration_chunk_load_tracing__ = false;
+              window.__webpack_chunk_load__ =(id) => import(id).then((m) => { if (id.includes("assets/client-components")) { Object.entries(m).forEach(([, value]) => { Object.entries(value).forEach(([k, v]) => { if (typeof window !== "undefined") { if (!window.__como_module_cache__.has(k)) { window.__como_module_cache__.set(k, v); } } }); }); } }).catch((ex) => { throw new Error(ex); });
+              window.__webpack_require__ =
+  (id) => {
+    if (window.__como_module_cache__ && window.__como_module_cache__.has(id)) {
+      return window.__como_module_cache__.get(id);
+    } else {
+      if (!Array.isArray(window.__missing_como_module_list__)) {
+        window.__missing_como_module_list__ = [];
+      }
+      window.__missing_como_module_list__.push(id);
+      return undefined;
+    }
+  }
+;
+            

@@ -24,8 +24,24 @@ dist/
 results.json
 results.csv
 results.md
+results.txt
+posts.json
+posts.csv
+posts.md
+posts.txt
 out/
 *.out.json
+
+# Debug dumps: a rendered LinkedIn page contains your name and feed content
+debug_page.html
+debug_report.json
+debug_page.png
+
+# Your own company allowlist (companies.example.txt IS tracked)
+companies.txt
+
+# Local secrets / LLM settings (.env.example IS tracked)
+.env
 
 # OS noise
 .DS_Store

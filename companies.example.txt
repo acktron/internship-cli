@@ -1,0 +1,40 @@
+# Target companies for:
+#   internship-radar company-posts --companies companies.example.txt --max-age-days 7 -o results.txt
+#
+# Also works as an allowlist for:
+#   internship-radar posts "AI intern" --allowlist companies.example.txt
+#
+# Format:
+#   - One company per line
+#   - Blank lines and `#` comments are ignored
+#   - A CSV export also works — the first column of each row is read
+#
+# company-posts searches LinkedIn for: "<Company>" intern
+# then keeps only STRONG matches:
+#   1. mentions the company
+#   2. hiring + internship co-occur (same sentence or ~15 words)
+#   3. job-offer cue (we're hiring / apply / role: / DM / …) near intern+domain
+#   4. AI / ML / data / software term near that internship mention
+#
+# THIS IS A FORMAT EXAMPLE (~20 names). Replace with your own target list.
+
+Sarvam AI
+Krutrim
+CoRover
+Zomato
+Razorpay
+Groww
+Meesho
+Postman
+Hasura
+Atlan
+BrowserStack
+Freshworks
+Chargebee
+Druva
+Innovaccer
+Mad Street Den
+Observe.AI
+Yellow.ai
+Ola Electric
+Swiggy

@@ -69,6 +69,14 @@ def persistent_context(
             ) from exc
 
         try:
+            context.grant_permissions(
+                ["clipboard-read", "clipboard-write"],
+                origin="https://www.linkedin.com",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
             yield context
         finally:
             context.close()
