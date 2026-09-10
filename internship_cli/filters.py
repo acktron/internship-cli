@@ -800,6 +800,12 @@ def _roundup_signals(text: str) -> list[str]:
     return signals
 
 
+def is_structural_roundup(text: str) -> bool:
+    """True only for a list of multiple openings/companies, not a lone hashtag."""
+    signals = set(_roundup_signals(text))
+    return bool({"multi-role-dump", "multi-company-openings"}.intersection(signals))
+
+
 def source_spam_signals(
     text: str,
     *,

@@ -1,0 +1,1 @@
+export const mockFiles = [{name:'Machine_Learning_Notes.pdf',meta:'2.4 MB • Added 2 days ago',type:'pdf'},{name:'Project_Report.docx',meta:'1.1 MB • Added 4 days ago',type:'doc'},{name:'Sales_Data.xlsx',meta:'850 KB • Added 5 days ago',type:'xls'},{name:'DBMS_Unit1.pdf',meta:'3.2 MB • Added 1 week ago',type:'pdf'},{name:'todo.txt',meta:'12 KB • Added 1 week ago',type:'txt'}]

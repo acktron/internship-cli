@@ -236,6 +236,7 @@ def test_semantic_gate_keeps_company_hiring_and_records_reason():
     assert len(kept) == 1
     assert "semantic:company_hiring" in kept[0]["why_matched"]
     assert kept[0]["gate_reason"].startswith("Target-company recruiter")
+    assert kept[0]["source_type"] == "recruiter"
     prompt = client.messages[0][0].content
     assert "link_categories: ['ats_or_careers']" in prompt
     assert "poster_employer: Razorpay" in prompt
@@ -310,7 +311,7 @@ def test_semantic_gate_rejects_model_labelled_candidate_showcase():
     assert kept == []
 
 
-def test_semantic_gate_reports_candidate_and_employer_mismatch_drops():
+def test_semantic_gate_keeps_third_party_ats_opening_despite_employer_mismatch():
     candidate_tally = {}
     candidate = {
         "company": "Acme", "poster": "Student", "snippet": "I am looking for an Acme internship.",
@@ -321,9 +322,10 @@ def test_semantic_gate_reports_candidate_and_employer_mismatch_drops():
     ) == []
     assert candidate_tally["Acme"]["gate:candidate_seeking"] == 1
 
-    mismatch = {
-        "company": "Acme", "poster": "Employee", "poster_employer": "OtherCo",
-        "author_affiliation_matches_target": False, "snippet": "Acme is hiring an intern. Apply now.",
+    third_party = {
+        "company": "Hiver", "poster": "Ashish Madhup", "poster_employer": "OtherCo",
+        "author_affiliation_matches_target": False, "link_categories": ["ats_or_careers"],
+        "link_class": "careers", "snippet": "We're hiring an SDE Intern at Hiver. Apply here: https://jobs.hiverhq.com/sde-intern",
         "post_url": "mismatch",
     }
     payload = {"results": [{
@@ -331,11 +333,47 @@ def test_semantic_gate_reports_candidate_and_employer_mismatch_drops():
         "cta_is_application": True, "role_named": True,
         "intent": "company_hiring", "reason": "Model claims this is an offer.",
     }]}
-    mismatch_tally = {}
+    kept = gate_company_posts_semantic(
+        _FakeClient(json.dumps(payload)), [third_party], log=lambda _m: None,
+    )
+    assert len(kept) == 1
+    assert kept[0]["source_type"] == "third_party_with_apply_link"
+
+
+def test_semantic_gate_requires_affiliation_for_referral_only_post():
+    post = {
+        "company": "Hiver", "poster": "Third Party", "poster_employer": "OtherCo",
+        "author_affiliation_matches_target": False,
+        "snippet": "Hiver is hiring an SDE Intern. DM me for a referral.", "post_url": "referral-only",
+    }
+    payload = {"results": [{
+        "id": 0, "author_is_hirer": False, "is_offer_not_request": True,
+        "cta_is_application": False, "role_named": True,
+        "intent": "company_hiring", "reason": "Unaffiliated referral-only share.",
+    }]}
+    drops = {}
     assert gate_company_posts_semantic(
-        _FakeClient(json.dumps(payload)), [mismatch], drop_tally=mismatch_tally, log=lambda _m: None,
+        _FakeClient(json.dumps(payload)), [post], drop_tally=drops, log=lambda _m: None,
     ) == []
-    assert mismatch_tally["Acme"]["gate:employer_mismatch"] == 1
+    assert drops["Hiver"]["gate:employer_mismatch"] == 1
+
+
+def test_semantic_gate_drops_multi_company_roundup_even_if_model_calls_it_hiring():
+    post = {
+        "company": "Hiver", "poster": "Jobs Feed", "link_categories": ["ats_or_careers"],
+        "snippet": "1. Hiver is hiring SDE Intern. 2. Acme is hiring Backend Intern. Apply here.",
+        "post_url": "roundup",
+    }
+    payload = {"results": [{
+        "id": 0, "author_is_hirer": False, "is_offer_not_request": True,
+        "cta_is_application": True, "role_named": True,
+        "intent": "company_hiring", "reason": "Incorrectly marked as a single opening.",
+    }]}
+    drops = {}
+    assert gate_company_posts_semantic(
+        _FakeClient(json.dumps(payload)), [post], drop_tally=drops, log=lambda _m: None,
+    ) == []
+    assert drops["Hiver"]["gate:roundup"] == 1
 
 
 def test_semantic_gate_batches_at_five():

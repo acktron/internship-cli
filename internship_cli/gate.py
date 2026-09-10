@@ -13,6 +13,7 @@ from .filters import (
     KEEP_SOURCE_TYPES,
     SOURCE_TYPES,
     format_follower_count,
+    is_structural_roundup,
     normalise_company,
     parse_follower_count,
 )
@@ -73,6 +74,10 @@ Structured priors are authoritative evidence, not decoration:
   zero engagement appears with multiple shortener/junk links.
 - profile_prior=trusted_poster is a conservative local hint from repeated good
   history, not permission to keep a post that fails the required judgments.
+- A named, single-company role with an ATS/careers/company application path is
+  still a useful lead when posted by a third party. Do not require that poster
+  to work for the target company. Only use author affiliation as proof for
+  referral-only posts with no independent application path.
 
 Return JSON only:
 {"results":[{"id":0,"author_is_hirer":true,"is_offer_not_request":true,
@@ -462,28 +467,65 @@ def _salvage_semantic_verdicts(text: str, n: int) -> dict[int, dict[str, Any]]:
 
 
 def semantic_keep(verdict: dict[str, Any], post: dict[str, Any] | None = None) -> bool:
-    """Single tunable Python decision rule for company-posts semantic gating."""
-    basic = bool(
+    """Keep independently applyable openings; gate referral-only posts by author.
+
+    This deliberately separates lead usefulness from poster provenance.  A
+    third party can faithfully share a target-company ATS opening, while a bare
+    referral request needs a target-affiliated hirer to be trustworthy.
+    """
+    if not (
         verdict.get("intent") == "company_hiring"
-        and verdict.get("author_is_hirer")
-        and verdict.get("is_offer_not_request")
-        and (verdict.get("cta_is_application") or verdict.get("role_named"))
-    )
-    if not basic or not post:
-        return basic
-
-    employer = str(post.get("poster_employer") or "").strip()
-    if employer and not bool(post.get("author_affiliation_matches_target")):
+        and verdict.get("role_named")
+    ):
         return False
+    if not post:
+        return bool(verdict.get("cta_is_application") or verdict.get("author_is_hirer"))
 
+    text = "\n".join(str(post.get(key) or "") for key in ("post_text", "snippet"))
+    if is_structural_roundup(text):
+        return False
     categories = {str(value) for value in (post.get("link_categories") or [])}
     application = {"ats_or_careers", "company_domain"}
     non_application = {
         "poster_portfolio_or_github", "social_or_chat", "link_hub_or_junk",
     }
-    if categories.intersection(non_application) and not categories.intersection(application):
+    link_class = str(post.get("link_class") or "").lower()
+    explicit_apply = bool(re.search(
+        r"\b(?:apply\s+(?:here|now|via|using)|application\s+(?:form|link)|"
+        r"(?:share|send)\s+(?:your\s+)?(?:resume|cv)\s+to\s+\w+)",
+        text,
+        re.IGNORECASE,
+    ))
+    has_application_path = bool(
+        categories.intersection(application)
+        or link_class in {"ats_or_careers", "company_domain", "careers"}
+        or explicit_apply
+    )
+    if has_application_path:
+        # A self-promo/portfolio-only CTA is already excluded above; an actual
+        # application path wins even if the post also links to social context.
+        return True
+    if categories.intersection(non_application):
         return False
-    return True
+    employer = str(post.get("poster_employer") or "").strip()
+    return bool(
+        verdict.get("author_is_hirer")
+        and verdict.get("is_offer_not_request")
+        and (not employer or post.get("author_affiliation_matches_target"))
+    )
+
+
+def semantic_source_type(post: dict[str, Any], verdict: dict[str, Any]) -> str:
+    """Expose whether a kept lead came from the target or a share with apply link."""
+    existing = str(post.get("source_type") or "").lower()
+    if existing in {"company", "company_page"}:
+        return "company_page"
+    if existing in {"employee", "recruiter"}:
+        return existing
+    if verdict.get("author_is_hirer") and post.get("author_affiliation_matches_target"):
+        headline = str(post.get("poster_headline") or "")
+        return "recruiter" if re.search(r"\b(?:recruiter|talent|sourcer)\b", headline, re.I) else "employee"
+    return "third_party_with_apply_link"
 
 
 def gate_company_posts_semantic(
@@ -618,10 +660,18 @@ def gate_company_posts_semantic(
                     )
                     employer = str(post.get("poster_employer") or "").strip()
                     categories = set(post.get("link_categories") or [])
-                    if employer and not post.get("author_affiliation_matches_target"):
-                        drop_reason = "gate:employer_mismatch"
-                    elif verdict.get("intent") == "candidate_seeking":
+                    text = "\n".join(str(post.get(key) or "") for key in ("post_text", "snippet"))
+                    has_apply = bool(
+                        categories.intersection({"ats_or_careers", "company_domain"})
+                        or str(post.get("link_class") or "").lower() in {"ats_or_careers", "company_domain", "careers"}
+                        or re.search(r"\b(?:apply\s+(?:here|now|via|using)|application\s+(?:form|link))", text, re.I)
+                    )
+                    if verdict.get("intent") == "candidate_seeking":
                         drop_reason = "gate:candidate_seeking"
+                    elif is_structural_roundup(text):
+                        drop_reason = "gate:roundup"
+                    elif employer and not post.get("author_affiliation_matches_target") and not has_apply:
+                        drop_reason = "gate:employer_mismatch"
                     elif categories.intersection({"poster_portfolio_or_github", "social_or_chat", "link_hub_or_junk"}):
                         drop_reason = "gate:no_application_cta"
                     elif not verdict.get("author_is_hirer"):
@@ -642,6 +692,7 @@ def gate_company_posts_semantic(
                 prior = str(enriched.get("why_matched") or "").strip()
                 enriched["why_matched"] = f"{prior}; {decision}" if prior else decision
                 enriched["gate_reason"] = verdict["reason"]
+                enriched["source_type"] = semantic_source_type(enriched, verdict)
                 kept.append(enriched)
                 history_rows.append(_history_row(enriched, kept=True, verdict=verdict))
 
