@@ -249,6 +249,14 @@ class RedirectResolver:
 _REDIRECT_HOSTS = frozenset({
     "lnkd.in", "bit.ly", "t.co", "tinyurl.com", "ow.ly", "buff.ly",
 })
+_SOCIAL_OR_CHAT_HOST_SUFFIXES = (
+    "chat.whatsapp.com", "wa.me", "api.whatsapp.com", "whatsapp.com",
+    "t.me", "telegram.me", "telegram.org", "discord.gg", "discord.com",
+)
+_LINK_HUB_OR_JUNK_HOST_SUFFIXES = ("linktr.ee", "bio.link", "jobscans.in")
+_PORTFOLIO_HOST_SUFFIXES = (
+    "github.com", "gitlab.com", "bitbucket.org", "behance.net", "dribbble.com",
+)
 
 
 def _looks_like_redirect_host(url: str) -> bool:
@@ -321,3 +329,34 @@ def classify_links(
     else:
         kind = "unknown"
     return LinkVerdict(kind=kind, urls=unique, resolved=resolved, reasons=reasons)
+
+
+def classify_link_categories(
+    urls: Iterable[str],
+    *,
+    company: str = "",
+    resolver: RedirectResolver | None = None,
+) -> tuple[LinkVerdict, list[str]]:
+    """Resolve URLs once and return categories suitable for semantic gating."""
+    verdict = classify_links(urls, company=company, resolver=resolver)
+    categories: list[str] = []
+    for raw in verdict.urls:
+        final = verdict.resolved.get(raw, raw)
+        host = _host(final) or _host(raw)
+        if _host_matches(host, _SOCIAL_OR_CHAT_HOST_SUFFIXES):
+            category = "social_or_chat"
+        elif _host_matches(host, _LINK_HUB_OR_JUNK_HOST_SUFFIXES):
+            category = "link_hub_or_junk"
+        elif _host_matches(host, _PORTFOLIO_HOST_SUFFIXES):
+            category = "poster_portfolio_or_github"
+        elif _company_domain_hit(host, company):
+            category = "company_domain"
+        elif classify_final_url(final, company=company) == "careers":
+            category = "ats_or_careers"
+        elif verdict.kind == "junk":
+            category = "link_hub_or_junk"
+        else:
+            category = "unknown"
+        if category not in categories:
+            categories.append(category)
+    return verdict, categories

@@ -10,6 +10,9 @@ from internship_cli.filters import (
     text_mentions_company,
 )
 from internship_cli.output import make_snippet, write_results
+from internship_cli.posts import (
+    Post, _strong_hits_for_company, dedupe_posts_by_identity, funnel_counts_are_monotonic,
+)
 
 # --- Real Zomato false positives from results.txt (bag-of-words used to keep these) ---
 
@@ -167,6 +170,48 @@ def test_scattered_keywords_rejected():
     )
     result = match_strong_company(text, "Zomato")
     assert result.matched is False
+
+
+def test_loose_prefilter_sends_a_broader_candidate_net_than_strict():
+    posts = [
+        Post(poster="Riya", poster_headline="Recruiter at Acme", post_text="Acme is hiring a Software Intern. Apply now."),
+        Post(poster="Riya", poster_headline="Recruiter at Acme", post_text="Acme is hiring an HR Intern. Apply now."),
+        Post(poster="Student", post_text="I built for Acme and am looking for an internship."),
+    ]
+    strict = _strong_hits_for_company(
+        posts, "Acme", HiringMatcher(mode="all"), {"weak": 0, "not_first_party": 0}, prefilter="strict",
+    )
+    loose = _strong_hits_for_company(
+        posts, "Acme", HiringMatcher(mode="all"), {"weak": 0, "not_first_party": 0}, prefilter="loose",
+    )
+    assert len(loose) > len(strict)
+
+
+def test_funnel_counts_are_monotonic():
+    assert funnel_counts_are_monotonic({
+        "seen": 36, "passed_prefilter": 12, "sent_to_gate": 10, "kept_by_gate": 4,
+    })
+    assert not funnel_counts_are_monotonic({
+        "seen": 3, "passed_prefilter": 4, "sent_to_gate": 2, "kept_by_gate": 1,
+    })
+
+
+def test_strict_prefilter_without_gate_is_unchanged():
+    post = Post(poster="Riya", poster_headline="Recruiter at Acme", post_text="Acme is hiring a Software Intern. Apply now.")
+    default = _strong_hits_for_company(
+        [post], "Acme", HiringMatcher(mode="all"), {"weak": 0, "not_first_party": 0},
+    )
+    explicit = _strong_hits_for_company(
+        [post], "Acme", HiringMatcher(mode="all"), {"weak": 0, "not_first_party": 0}, prefilter="strict",
+    )
+    assert len(default) == len(explicit) == 1
+
+
+def test_duplicate_posts_across_query_variations_are_collapsed_before_prefilter():
+    first = Post(poster="Riya", post_text="Hiver is hiring an SDE Intern")
+    duplicate = Post(poster="Riya", post_text="Hiver is  hiring an SDE Intern")
+    other = Post(poster="Nia", post_text="Hiver is hiring a Backend Intern")
+    assert dedupe_posts_by_identity([first, duplicate, other]) == [first, other]
 
 
 def test_load_companies_preserves_order_and_skips_comments():

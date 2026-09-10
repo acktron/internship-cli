@@ -145,7 +145,7 @@ def test_txt_output_blocks_use_permalink_not_search():
     out.unlink(missing_ok=True)
 
 
-def test_dedupe_key_prefers_permalink():
+def test_dedupe_key_prefers_permalink_then_poster_and_normalized_text():
     from internship_cli.posts import _post_dedupe_key
 
     post = Post(
@@ -156,5 +156,8 @@ def test_dedupe_key_prefers_permalink():
     search = Post(
         post_url="https://www.linkedin.com/search/results/content/?keywords=x",
         activity_urn=f"urn:li:activity:{_OTHER_ID}",
+        poster="Ada",
+        post_text="Hiring   an intern",
     )
-    assert _post_dedupe_key(search) == f"urn:li:activity:{_OTHER_ID}"
+    same = Post(poster="Ada", post_text="Hiring an intern")
+    assert _post_dedupe_key(search) == _post_dedupe_key(same)

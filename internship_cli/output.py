@@ -20,7 +20,10 @@ POST_FIELDS = (
 # Compact listing for --format txt: one block per post.
 TXT_FIELDS = ("company", "role", "post_url", "why_matched", "source_type")
 # company-posts: target company + snippet + link + why.
-COMPANY_POST_FIELDS = ("company", "poster", "snippet", "post_url", "why_matched", "source_type")
+COMPANY_POST_FIELDS = (
+    "company", "poster", "poster_employer", "link_class", "snippet", "post_url",
+    "why_matched", "gate_reason", "source_type",
+)
 
 
 def make_snippet(text: str, max_chars: int = 240) -> str:

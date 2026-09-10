@@ -305,6 +305,33 @@ def normalise_company(name: str) -> str:
     return " ".join(tokens)
 
 
+_STUDENT_HEADLINE_RE = re.compile(
+    r"\b(?:student|undergraduate|university|college|b\.?tech|m\.?tech|"
+    r"bachelor|master|class of|bits)\b",
+    re.IGNORECASE,
+)
+_HEADLINE_EMPLOYER_RE = re.compile(
+    r"(?:@|\bat\b)\s*([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,3})"
+)
+
+
+def poster_employer_from_headline(headline: str) -> str:
+    """Best-effort current employer from a LinkedIn headline, else empty."""
+    value = (headline or "").strip()
+    if not value or _STUDENT_HEADLINE_RE.search(value):
+        return ""
+    match = _HEADLINE_EMPLOYER_RE.search(value)
+    return match.group(1).strip(" |,·") if match else ""
+
+
+def author_affiliation_matches_target(headline: str, target_company: str) -> bool:
+    """True only when a parsed employer loosely matches the target company."""
+    employer = poster_employer_from_headline(headline)
+    if not employer or not target_company:
+        return False
+    return company_in_allowlist(employer, {normalise_company(target_company)})
+
+
 def load_allowlist(path: str | Path) -> set[str]:
     """Read a company allowlist. One name per line; `#` comments allowed.
 
@@ -656,11 +683,59 @@ def match_strong_company(
     return MatchResult(matched, reasons)
 
 
+_OBVIOUS_CELEBRATION_RE = re.compile(
+    r"\b(?:completed|finished|wrapped up)\s+(?:my|our|an?)\s*internship\b"
+    r"|\b(?:internship|intern)\s+(?:journey|story|experience|diary)\b"
+    r"|\b(?:offer accepted|excited to (?:share|announce).{0,60}\b(?:joined|intern))\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def match_company_candidate_net(
+    text: str,
+    company: str,
+    matcher: HiringMatcher | None = None,
+    *,
+    company_text: str | None = None,
+) -> MatchResult:
+    """Broad, explainable candidate net for the semantic-gated pipeline.
+
+    It deliberately requires only a target-company mention and *either* an
+    internship or hiring signal.  It is not an opening decision: the semantic
+    gate remains responsible for offer intent, author affiliation, and CTA.
+    Obvious retrospective celebration copy is excluded here because it cannot
+    become a current opening regardless of later semantic interpretation.
+    """
+    empty = MatchResult(False, ["company:none", "candidate_terms:none"])
+    if not (text or "").strip():
+        return empty
+
+    matcher = matcher or HiringMatcher(mode="all")
+    mention_haystack = company_text if company_text is not None else text
+    mentioned = text_mentions_company(mention_haystack, company)
+    hiring = matcher._hits("hiring", text)
+    role = matcher._hits("role", text)
+    if _OBVIOUS_CELEBRATION_RE.search(text):
+        return MatchResult(False, [
+            f"company:{company}" if mentioned else "company:none",
+            "candidate_terms:" + ", ".join((hiring + role)[:3])
+            if hiring or role else "candidate_terms:none",
+            "celebration:obvious",
+        ])
+    matched = bool(mentioned and (hiring or role))
+    return MatchResult(matched, [
+        f"company:{company}" if mentioned else "company:none",
+        "hiring:" + ", ".join(hiring[:3]) if hiring else "hiring:none",
+        "role:" + ", ".join(role[:3]) if role else "role:none",
+    ])
+
+
 # --------------------------------------------------------------------------
 # Source legitimacy (mention vs first-party posting)
 # --------------------------------------------------------------------------
 
 _HASHTAG_RE = re.compile(r"(?:^|\s)#\w+")
+_HASHTAG_TOKEN_RE = re.compile(r"(?<!\w)#\w+")
 _DM_REFERRAL_RE = re.compile(
     r"\b(?:dm|message|ping)\s+me\b.{0,80}\b(?:referral|refer)\b"
     r"|\b(?:referral|refer)\b.{0,80}\b(?:dm|message)\s+me\b",
@@ -676,7 +751,7 @@ _GENERIC_DM_HIRE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _MULTI_ROLE_DUMP_RE = re.compile(
-    r"(?:(?:^|\n)\s*(?:\d+[\).]|[-•])\s*.{0,60}(?:intern|opening|hiring).*){3,}",
+    r"(?:(?:^|\n)\s*(?:\d+[\).]|[-•]|[1-9]️⃣)\s*.{0,90}(?:intern|opening|hiring|role).*){2,}",
     re.IGNORECASE,
 )
 _CREATOR_FARMER_RE = re.compile(
@@ -684,10 +759,45 @@ _CREATOR_FARMER_RE = re.compile(
     r"|\bfollow\s+for\s+(?:more\s+)?(?:jobs|openings)\b",
     re.IGNORECASE,
 )
+_ROUNDUP_LANGUAGE_RE = re.compile(
+    r"\b(?:mass hiring|multiple hiring alerts?|latest tech openings?|"
+    r"hiring alerts?|top (?:tech )?openings?|job roundup)\b",
+    re.IGNORECASE,
+)
+_COMPANY_HIRING_RE = re.compile(
+    r"\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,2})\s+(?:is\s+|now\s+)?hiring\b"
+)
+_COMPANY_FIELD_RE = re.compile(r"(?:^|\n)\s*company\s*:\s*([^\n|#]+)", re.IGNORECASE)
 
 
 def count_hashtags(text: str) -> int:
     return len(_HASHTAG_RE.findall(text or ""))
+
+
+def _without_hashtags(text: str) -> str:
+    """Remove tag tokens before judging prose structure or spam intent."""
+    return _HASHTAG_TOKEN_RE.sub("", text or "")
+
+
+def _roundup_signals(text: str) -> list[str]:
+    """Detect structural multi-opening posts, not harmless formatting noise."""
+    body = _without_hashtags(text)
+    signals: list[str] = []
+    if _ROUNDUP_LANGUAGE_RE.search(body):
+        signals.append("roundup-language")
+    if _MULTI_ROLE_DUMP_RE.search(body):
+        signals.append("multi-role-dump")
+    names = {
+        re.sub(r"\s+", " ", match.group(1)).strip().lower()
+        for match in _COMPANY_HIRING_RE.finditer(body)
+    }
+    names.update(
+        re.sub(r"\s+", " ", match.group(1)).strip().lower()
+        for match in _COMPANY_FIELD_RE.finditer(body)
+    )
+    if len(names) >= 2:
+        signals.append("multi-company-openings")
+    return signals
 
 
 def source_spam_signals(
@@ -700,10 +810,7 @@ def source_spam_signals(
 ) -> list[str]:
     """Cheap REJECT cues for aggregator / farmer / invite-only posts."""
     signals: list[str] = []
-    body = text or ""
-    tags = count_hashtags(body)
-    if tags > 8:
-        signals.append(f"hashtags:{tags}")
+    body = _without_hashtags(text)
     if _DM_REFERRAL_RE.search(body):
         signals.append("dm-for-referral")
     if link_kind == "junk":
@@ -712,8 +819,7 @@ def source_spam_signals(
         signals.append("group-invite")
     if _GENERIC_DM_HIRE_RE.search(body) and link_kind not in {"careers"}:
         signals.append("generic-dm-hire")
-    if _MULTI_ROLE_DUMP_RE.search(body):
-        signals.append("multi-role-dump")
+    signals.extend(_roundup_signals(body))
     if _CREATOR_FARMER_RE.search(body):
         signals.append("aggregator-copy")
     if (
@@ -753,7 +859,6 @@ def heuristic_source_reject(
         return True, "junk-link:" + (",".join(signals) if signals else "invite-or-chat")
     # DM-for-referral / generic "DM me" are apply-path cues, not automatic junk.
     hard_prefixes = {
-        "hashtags",
         "group-invite",
         "multi-role-dump",
         "aggregator-copy",

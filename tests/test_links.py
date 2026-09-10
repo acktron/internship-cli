@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from internship_cli.links import (
     RedirectResolver,
+    classify_link_categories,
     classify_final_url,
     classify_links,
     extract_urls_from_text,
@@ -28,6 +29,21 @@ def test_classify_ats_and_careers_path():
         "https://www.linkedin.com/jobs/view/123",
     ) == "careers"
     assert classify_final_url("https://sarvam.ai/blog", company="Sarvam AI") == "careers"
+
+
+def test_structured_link_categories_cover_ats_company_and_portfolio():
+    verdict, categories = classify_link_categories(
+        [
+            "https://boards.greenhouse.io/acme/jobs/1",
+            "https://acme.com/careers",
+            "https://github.com/student/demo",
+        ],
+        company="Acme",
+    )
+    assert verdict.kind == "careers"
+    assert "ats_or_careers" in categories
+    assert "company_domain" in categories
+    assert "poster_portfolio_or_github" in categories
 
 
 def test_classify_junk_hosts():
@@ -72,17 +88,33 @@ def test_resolver_caches_and_follows():
     assert calls["n"] == 1
 
 
-def test_heuristic_rejects_hashtags_and_dm_referral():
+def test_heuristic_keeps_single_company_hiring_with_many_hashtags():
     text = (
-        "I'm hiring DM me for referral "
-        "#jobs #hiring #intern #ai #ml #sde #backend #frontend #freshers #apply"
+        "Hiver Hiring. Role: SDE Intern. Location: Bangalore. Job Requirements: Python. "
+        "DM me for referral "
+        "#jobs #hiring #intern #ai #ml #sde #backend #frontend #freshers #apply "
+        "#java #cloud #remote #graduate #careers #bangalore"
     )
     signals = source_spam_signals(text, link_kind="none")
-    assert any(s.startswith("hashtags:") for s in signals)
+    assert not any(s.startswith("hashtags:") for s in signals)
     assert "dm-for-referral" in signals
+    reject, reason = heuristic_source_reject(text, link_kind="none")
+    assert reject is False, reason
+
+
+def test_heuristic_rejects_structural_multi_company_mass_hiring_roundup():
+    text = (
+        "MASS HIRING — latest tech openings\n"
+        "1️⃣ Hiver is hiring SDE Intern\n"
+        "2️⃣ Acme is hiring Backend Intern\n"
+        "DM for referral"
+    )
     reject, reason = heuristic_source_reject(text, link_kind="none")
     assert reject is True
     assert "source-spam" in reason
+    assert any(signal in reason for signal in (
+        "roundup-language", "multi-company-openings", "multi-role-dump",
+    ))
 
 
 def test_heuristic_keeps_company_careers():

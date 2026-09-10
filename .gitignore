@@ -5,7 +5,9 @@ env/
 
 # Python bytecode / build artifacts
 __pycache__/
+**/__pycache__/
 *.py[cod]
+*.pyc
 *.egg-info/
 build/
 dist/
@@ -36,12 +38,18 @@ out/
 debug_page.html
 debug_report.json
 debug_page.png
+debug_raw_doc.html
+debug_frame_*.html
+debug_card.html
+debug_responses/
 
 # Your own company allowlist (companies.example.txt IS tracked)
 companies.txt
 
 # Local secrets / LLM settings (.env.example IS tracked)
 .env
+.gate_history.jsonl
 
 # OS noise
 .DS_Store
+.aider*

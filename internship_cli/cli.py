@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import click
@@ -15,6 +16,7 @@ from .agent import (
     build_agent,
     describe_backend,
 )
+from .gate import DEFAULT_GATE_HISTORY_PATH, apply_gate_labels
 from .browser import (
     DEFAULT_USER_DATA_DIR,
     BrowserSessionError,
@@ -34,7 +36,7 @@ from .filters import (
     load_allowlist,
     load_companies,
 )
-from .llm import LLMError, load_project_env
+from .llm import LLMError, get_llm_client, load_project_env
 from .output import (
     COMPANY_POST_FIELDS,
     FORMATS,
@@ -555,12 +557,43 @@ def posts(
          "employees, recruiters, or credible creators. Loose: also allow "
          "aggregator mentions of the company.",
 )
+@click.option(
+    "--semantic-gate/--no-semantic-gate",
+    default=None,
+    help=(
+        "Use the fail-closed LLM semantic gate after deterministic company matching. "
+        "Enabled automatically when the configured LLM backend is available."
+    ),
+)
+@click.option(
+    "--prefilter",
+    type=click.Choice(("strict", "loose"), case_sensitive=False),
+    default=None,
+    help="Candidate stage. Defaults to loose with a semantic gate, strict without one.",
+)
+@click.option(
+    "--adaptive-gate/--no-adaptive-gate",
+    default=True,
+    show_default=True,
+    help="Use local semantic-gate history as conservative company-specific priors.",
+)
+@click.option(
+    "--gate-history",
+    default=DEFAULT_GATE_HISTORY_PATH,
+    show_default=True,
+    help="Local JSONL history for semantic-gate decisions and labels.",
+)
 @click.option("--headless", is_flag=True,
               help="Run without a visible window (requires an existing logged-in profile).")
 @click.option(
     "--debug-strong",
     is_flag=True,
     help="Log why each hiring-pass post fails the STRONG gate.",
+)
+@click.option(
+    "--debug-funnel",
+    is_flag=True,
+    help="Log every prefilter and semantic-gate drop with its reason.",
 )
 @_profile_option
 def company_posts(
@@ -580,7 +613,12 @@ def company_posts(
     domain_terms: str | None,
     keep_undated: bool,
     strict_source: bool,
+    semantic_gate: bool | None,
+    prefilter: str | None,
+    adaptive_gate: bool,
+    gate_history: str,
     debug_strong: bool,
+    debug_funnel: bool,
     headless: bool,
     user_data_dir: str,
 ) -> None:
@@ -639,6 +677,23 @@ def company_posts(
         domain_terms=_split_terms(domain_terms, DEFAULT_DOMAIN_TERMS),
         mode="all",
     )
+    semantic_client = None
+    if semantic_gate is not False:
+        try:
+            semantic_client = get_llm_client()
+            click.secho(
+                f"Semantic gate: enabled ({semantic_client.backend} / {semantic_client.model})",
+                fg="cyan",
+            )
+
+        except LLMError as exc:
+            click.secho(
+                f"Semantic gate: skipped ({exc}) — keeping deterministic matches.",
+                fg="yellow",
+            )
+
+    effective_prefilter = prefilter or ("loose" if semantic_client is not None else "strict")
+    click.secho(f"Company prefilter: {effective_prefilter}", fg="cyan")
 
     try:
         with persistent_context(user_data_dir, headless=headless) as context:
@@ -659,6 +714,11 @@ def company_posts(
                 keep_undated=keep_undated,
                 strict_source=strict_source,
                 debug_strong=debug_strong,
+                debug_funnel=debug_funnel,
+                semantic_client=semantic_client,
+                prefilter=effective_prefilter,
+                adaptive_gate=adaptive_gate,
+                gate_history_path=gate_history,
                 network_idle_ms=network_idle_ms,
                 wait_for_posts_ms=wait_for_posts_ms,
                 log=lambda message: click.echo(f"  {message}"),
@@ -690,8 +750,13 @@ def company_posts(
             "companies_file": companies_path,
             "companies": len(companies),
             "max_age_days": max_age_days,
-            "match": "strong (company + hire~intern proximity + offer cue~domain)",
+            "prefilter": effective_prefilter,
             "searched": totals["searched"],
+            "semantic_gate": semantic_client is not None,
+            "semantic_before": totals.get("semantic_before", 0),
+            "semantic_kept": totals.get("semantic_kept", 0),
+            "adaptive_gate": adaptive_gate,
+            "funnel": totals.get("funnel_by_company", {}),
             "group_by": "company",
         },
     )
@@ -704,10 +769,44 @@ def company_posts(
         click.echo(f"  • {company}: {count} post(s)")
 
     click.secho(
-        f"\nWrote {len(results)} strong match(es) across {len(by_company)} "
+        f"\nWrote {len(results)} match(es) across {len(by_company)} "
         f"company(ies) to {written} as {fmt}.",
         fg="green",
     )
+
+
+@main.command("label")
+@click.option(
+    "--labels",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSONL file with {post_url, label}; label is good or bad.",
+)
+@click.option(
+    "--gate-history",
+    default=DEFAULT_GATE_HISTORY_PATH,
+    show_default=True,
+    help="Local JSONL semantic-gate history to update.",
+)
+def label(labels: str, gate_history: str) -> None:
+    """Record good/bad feedback for previously gated post URLs."""
+    rows: list[dict] = []
+    try:
+        for line in Path(labels).read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if isinstance(value, dict):
+                rows.append(value)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(
+            "Labels must be JSONL rows such as "
+            '{"post_url":"https://www.linkedin.com/...","label":"good"}. '
+            f"Could not read labels: {exc}"
+        ) from exc
+
+    updated = apply_gate_labels(rows, gate_history)
+    click.secho(f"Recorded {updated} label(s) in {gate_history}.", fg="green")
 
 
 @main.command("agent")

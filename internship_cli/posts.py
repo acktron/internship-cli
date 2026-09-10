@@ -11,35 +11,41 @@ from __future__ import annotations
 import re
 import sys
 import time
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
 
 from .debug import dump_debug
+from .gate import gate_company_posts_semantic
 from .filters import (
     HiringMatcher,
+    author_affiliation_matches_target,
     classify_first_party,
     company_field_from_post,
     extract_funding_mentions,
     heuristic_source_reject,
     humanise_age,
     linkedin_date_filter,
+    match_company_candidate_net,
     match_strong_company,
     opening_audit_reasons,
     parse_datetime_attr,
     parse_follower_count,
     parse_relative_date,
     poster_is_verified,
+    poster_employer_from_headline,
 )
 from .links import (
     RedirectResolver,
-    classify_links,
+    classify_link_categories,
     extract_urls_from_text,
     is_shortener,
 )
 from .output import make_snippet
 from .scraper import _clean_link, _dedupe_text
+from .llm import LLMClient
 
 CONTENT_SEARCH_URL = "https://www.linkedin.com/search/results/content/"
 
@@ -214,10 +220,12 @@ class Post:
     activity_urn: str = ""
     outbound_links: list[str] = field(default_factory=list)
     link_class: str = ""
+    link_categories: list[str] = field(default_factory=list)
     source_type: str = ""
     poster_headline: str = ""
     follower_count: int | None = None
     poster_verified: bool = False
+    engagement: dict[str, int] = field(default_factory=dict)
     days_old: float | None = None
     _reasons: list[str] = field(default_factory=list, repr=False)
     # Used by --resolve-links to reopen the poster's feed when the search card
@@ -1053,10 +1061,46 @@ def _post_body_text(card) -> str:
 
 def _company_from_headline(header: str) -> str:
     """Best-effort company from the poster's headline ("Architect @ TransUnion")."""
-    if not header:
-        return ""
-    match = _HEADLINE_COMPANY_RE.search(header.split("|")[0])
-    return match.group(1).strip() if match else ""
+    return poster_employer_from_headline(header)
+
+
+_ENGAGEMENT_RE = re.compile(
+    r"(?P<count>[\d,]+)\s*(?P<label>reactions?|likes?|comments?|reposts?|shares?)\b",
+    re.IGNORECASE,
+)
+
+
+def _engagement_from_card(card) -> dict[str, int]:
+    """Best-effort rendered engagement; lack of a count is not an error."""
+    try:
+        text = card.inner_text(timeout=1_500) or ""
+    except Exception:  # noqa: BLE001
+        return {}
+    counts = {"likes": 0, "comments": 0, "reposts": 0}
+    saw_count = False
+    for match in _ENGAGEMENT_RE.finditer(text):
+        try:
+            count = int(match.group("count").replace(",", ""))
+        except ValueError:
+            continue
+        saw_count = True
+        label = match.group("label").lower()
+        key = "likes" if label.startswith(("reaction", "like")) else (
+            "comments" if label.startswith("comment") else "reposts"
+        )
+        counts[key] = max(counts[key], count)
+    return counts if saw_count else {}
+
+
+def _engagement_spam_signal(engagement: dict[str, int], links: list[str]) -> str:
+    """One negative-only engagement heuristic for semantic-gate context."""
+    if (
+        engagement
+        and not any(engagement.values())
+        and sum(1 for link in links if is_shortener(link)) >= 2
+    ):
+        return "zero_engagement_multiple_shorteners"
+    return ""
 
 
 def _post_age_days(card, sub_description: str) -> float | None:
@@ -1182,6 +1226,7 @@ def _extract_post(card, page=None) -> Post | None:
         poster_headline=header,
         follower_count=parse_follower_count(f"{header}\n{poster}"),
         poster_verified=poster_is_verified(f"{header}\n{poster}"),
+        engagement=_engagement_from_card(card),
         days_old=age,
         _actor_profile_url=actor_profile,
     )
@@ -1196,6 +1241,8 @@ def _apply_filters(
     matcher: HiringMatcher,
     max_age_days: float,
     keep_undated: bool,
+    *,
+    candidate_company: str = "",
 ) -> tuple[bool, str]:
     """Return (keep, reason). Reason explains a drop or documents a match."""
     if post.days_old is None:
@@ -1207,9 +1254,17 @@ def _apply_filters(
     else:
         post._reasons.append(f"recency:{humanise_age(post.days_old)}")
 
-    result = matcher.match(post.post_text)
+    if candidate_company:
+        company_text = " ".join(
+            part for part in (post.post_text, post.company, post.poster, post.poster_headline) if part
+        )
+        result = match_company_candidate_net(
+            post.post_text, candidate_company, matcher, company_text=company_text,
+        )
+    else:
+        result = matcher.match(post.post_text)
     if not result.matched:
-        return False, f"not a hiring post ({result.why()})"
+        return False, f"not a candidate ({result.why()})" if candidate_company else f"not a hiring post ({result.why()})"
     post._reasons.extend(result.reasons)
 
     return True, ""
@@ -1219,6 +1274,8 @@ def _apply_link_and_source_gates(
     post: Post,
     resolver: RedirectResolver,
     company: str = "",
+    *,
+    require_opening: bool = True,
 ) -> tuple[bool, str]:
     """Classify outbound links and hard-drop junk / invite-only sources.
 
@@ -1227,8 +1284,11 @@ def _apply_link_and_source_gates(
     urls = list(post.outbound_links or [])
     if post.job_link:
         urls.append(post.job_link)
-    verdict = classify_links(urls, company=company or post.company, resolver=resolver)
+    verdict, categories = classify_link_categories(
+        urls, company=company or post.company, resolver=resolver,
+    )
     post.link_class = verdict.kind
+    post.link_categories = categories
     post._reasons.extend(verdict.reasons[:4])
     if verdict.kind == "careers":
         post._reasons.append("link:careers")
@@ -1246,7 +1306,7 @@ def _apply_link_and_source_gates(
     if reject:
         return True, why
 
-    if company:
+    if company and require_opening:
         apply_links = list(post.outbound_links or [])
         if post.job_link:
             apply_links.append(post.job_link)
@@ -1891,7 +1951,10 @@ def scrape_posts(
     log: Callable[[str], None] = print,
     link_resolver: RedirectResolver | None = None,
     target_company: str = "",
-) -> tuple[list[Post], dict[str, int], str]:
+    candidate_net: bool = False,
+    debug_funnel: bool = False,
+    defer_filters: bool = False,
+) -> tuple[list[Post], dict[str, Any], str]:
     """Scrape and filter LinkedIn post search results.
 
     Returns (kept posts, drop tally, search_url). The search URL is needed by
@@ -1904,20 +1967,47 @@ def scrape_posts(
     global _debug_card_written
     _debug_card_written = False
     resolver = link_resolver or RedirectResolver(delay=0.35, log=log)
-    stats = {
+    stats: dict[str, Any] = {
         "seen": 0, "kept": 0, "too_old": 0, "not_hiring": 0, "undated": 0,
         "unparsed": 0, "junk_link": 0, "source_spam": 0,
+        "drop_reasons": {},
     }
+
+    def dropped(stage: str, reason: str, post: Post | None = None) -> None:
+        if "company:none" in reason:
+            label = "no_company_mention"
+        elif "celebration:obvious" in reason:
+            label = "celebration"
+        elif "hiring:none" in reason and "role:none" in reason:
+            label = "no_intern_or_hiring_term"
+        elif reason.startswith("older"):
+            label = "too_old"
+        else:
+            label = reason.split(" (", 1)[0]
+        key = f"{stage}:{label}"
+        stats["drop_reasons"][key] = stats["drop_reasons"].get(key, 0) + 1
+        if debug_funnel:
+            snippet = ((post.post_text if post else "") or "").replace("\n", " ")[:120]
+            log(f"    funnel→drop {stage}: {post.poster if post else '?'} — {reason} | {snippet!r}")
 
     url = build_content_url(query, max_age_days=max_age_days, sort_by_date=sort_by_date,
                             location=location)
     log(f"Content search: {url}")
 
+    raw_html = ""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        _resp = page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        if _resp is not None:
+            raw_html = _resp.text()
     except Exception as exc:  # noqa: BLE001
         log(f"Could not load the search page: {exc}")
         return [], stats, url
+
+    # Build URN lookup from the raw server HTML (before hydration strips them).
+    # Direct href anchors: href="/feed/update/urn:li:…/"
+    _href_urns: list[str] = re.findall(
+        r'/feed/update/(urn:li:(?:share|activity|ugcPost):\d+)/', raw_html
+    )
 
     try:
         page.wait_for_load_state("networkidle", timeout=network_idle_ms)
@@ -1987,7 +2077,16 @@ def scrape_posts(
         seen_keys.add(key)
         stats["seen"] += 1
 
-        keep, reason = _apply_filters(post, matcher, max_age_days, keep_undated)
+        # company-posts dedupes across every query variation before any filter.
+        # Return raw extracted cards so its coordinator owns that single funnel.
+        if defer_filters:
+            kept.append(post)
+            continue
+
+        keep, reason = _apply_filters(
+            post, matcher, max_age_days, keep_undated,
+            candidate_company=target_company if candidate_net else "",
+        )
         if not keep:
             if reason.startswith("older"):
                 stats["too_old"] += 1
@@ -1995,16 +2094,19 @@ def scrape_posts(
                 stats["undated"] += 1
             else:
                 stats["not_hiring"] += 1
+            dropped("prefilter", reason, post)
             continue
 
         reject, why = _apply_link_and_source_gates(
-            post, resolver, company=target_company or post.company
+            post, resolver, company=target_company or post.company,
+            require_opening=not candidate_net,
         )
         if reject:
             if why.startswith("junk-link"):
                 stats["junk_link"] += 1
             else:
                 stats["source_spam"] += 1
+            dropped("source", why, post)
             continue
 
         mentions = extract_funding_mentions(post.post_text)
@@ -2015,6 +2117,7 @@ def scrape_posts(
         post.why_matched = "; ".join(post._reasons)
         if post.post_url and not _is_exact_post_url(post.post_url):
             _clear_post_url(post)
+
         kept.append(post)
         stats["kept"] += 1
 
@@ -2025,6 +2128,22 @@ def scrape_posts(
         if delay:
             time.sleep(min(delay, 0.2))
 
+    if defer_filters:
+        return kept, stats, url
+
+    # Apply the cheap raw-html href fallback if exactly one unresolved card
+    unresolved_posts = [p for p in kept if not p.post_url]
+    if len(unresolved_posts) == 1 and len(_href_urns) == 1:
+        unresolved_posts[0].post_url = f"https://www.linkedin.com/feed/update/{_href_urns[0]}/"
+        log("  -> permalink (href-fallback): " + unresolved_posts[0].post_url)
+
+    # Add notes for any still unresolved posts
+    for p in kept:
+        if not p.post_url:
+            p.post_url = "link unavailable — LinkedIn did not expose a permalink for this post (reshare/company/external)"
+
+    resolved = sum(1 for p in kept if p.post_url and p.post_url.startswith("http"))
+    log(f"post_url resolved {resolved} / {len(kept)} kept posts")
     return kept, stats, url
 
 
@@ -2143,21 +2262,47 @@ def default_company_queries(
 def _post_dedupe_key(post: Post) -> str:
     if post.post_url and not _is_search_results_url(post.post_url):
         return post.post_url.rstrip("/").lower()
-    if post.activity_urn:
-        return post.activity_urn.lower()
-    return f"{post.poster}|{(post.post_text or '')[:120]}".lower()
+    normalized = re.sub(r"\s+", " ", post.post_text or "").strip().lower()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"text:{(post.poster or '').strip().lower()}:{digest}"
+
+
+def dedupe_posts_by_identity(posts: list[Post], seen: set[str] | None = None) -> list[Post]:
+    """Keep one post per permalink, else per poster plus normalized-text hash."""
+    keys = seen if seen is not None else set()
+    unique: list[Post] = []
+    for post in posts:
+        key = _post_dedupe_key(post)
+        if key in keys:
+            continue
+        keys.add(key)
+        unique.append(post)
+    return unique
+
+
+def funnel_counts_are_monotonic(funnel: dict[str, Any]) -> bool:
+    """Guard the four public funnel counters against instrumentation regressions."""
+    return (
+        int(funnel.get("seen", 0)) >= int(funnel.get("passed_prefilter", 0))
+        >= int(funnel.get("sent_to_gate", 0))
+        >= int(funnel.get("kept_by_gate", 0))
+    )
 
 
 def _strong_hits_for_company(
     found: list[Post],
     company: str,
     matcher: HiringMatcher,
-    totals: dict[str, int],
+    totals: dict[str, Any],
     *,
     strict_source: bool = True,
+    prefilter: str = "strict",
     debug_strong: bool = False,
+    debug_funnel: bool = False,
+    drop_tally: dict[str, int] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> list[tuple[Post, list[str]]]:
+    """Apply strict opening checks or the broad semantic-gate candidate net."""
     kept: list[tuple[Post, list[str]]] = []
     for post in found:
         mention_text = " ".join(
@@ -2170,20 +2315,38 @@ def _strong_hits_for_company(
             )
             if part
         )
-        strong = match_strong_company(
-            post.post_text or "",
-            company,
-            matcher=matcher,
-            company_text=mention_text,
+        strong = (
+            match_company_candidate_net(
+                post.post_text or "", company, matcher=matcher, company_text=mention_text,
+            )
+            if prefilter == "loose"
+            else match_strong_company(
+                post.post_text or "", company, matcher=matcher, company_text=mention_text,
+            )
         )
         if not strong.matched:
             totals["weak"] += 1
-            if debug_strong and log:
+            reason = strong.why()
+            totals.setdefault("prefilter_drops", {})[reason] = totals.setdefault("prefilter_drops", {}).get(reason, 0) + 1
+            if drop_tally is not None:
+                drop_tally[f"prefilter:{reason}"] = drop_tally.get(f"prefilter:{reason}", 0) + 1
+            if (debug_strong or debug_funnel) and log:
                 snippet = (post.post_text or "").replace("\n", " ")[:140]
                 log(
-                    f"    weak: {post.poster or '?'} — {strong.why()} "
+                    f"    funnel→drop prefilter: {post.poster or '?'} — {reason} "
                     f"| {snippet!r}"
                 )
+            continue
+        # In loose mode scraper has already performed the cheap source spam
+        # rejection. Do not demand first-party proof here: that is semantic
+        # gate territory. Keep a source label only for explainable output.
+        if prefilter == "loose":
+            source_type, _keep, reason = classify_first_party(
+                company, poster=post.poster, headline=post.poster_headline,
+                text=post.post_text, apply_links=list(post.outbound_links or []), strict=False,
+            )
+            post.source_type = source_type
+            kept.append((post, list(strong.reasons) + [f"candidate-net:{reason}"]))
             continue
         apply_links = list(post.outbound_links or [])
         if post.job_link:
@@ -2206,9 +2369,13 @@ def _strong_hits_for_company(
         )
         if not keep:
             totals["not_first_party"] = totals.get("not_first_party", 0) + 1
-            if debug_strong and log:
+            totals.setdefault("prefilter_drops", {})[f"source:{reason}"] = totals.setdefault("prefilter_drops", {}).get(f"source:{reason}", 0) + 1
+            if drop_tally is not None:
+                key = f"prefilter:source:{reason}"
+                drop_tally[key] = drop_tally.get(key, 0) + 1
+            if (debug_strong or debug_funnel) and log:
                 log(
-                    f"    strong→drop: {post.poster or '?'} — "
+                    f"    funnel→drop prefilter: {post.poster or '?'} — "
                     f"{source_type}: {reason}"
                 )
             continue
@@ -2238,19 +2405,29 @@ def search_company_internship_posts(
     wait_for_posts_ms: int = 20_000,
     strict_source: bool = True,
     debug_strong: bool = False,
+    semantic_client: LLMClient | None = None,
+    prefilter: str | None = None,
+    adaptive_gate: bool = True,
+    gate_history_path: str = ".gate_history.jsonl",
+    debug_funnel: bool = False,
     log: Callable[[str], None] = print,
-) -> tuple[list[dict[str, str]], dict[str, int]]:
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Walk companies with several query variations; merge STRONG matches.
 
     For each company, runs up to `max_queries_per_company` LinkedIn searches
     (narrow → broader). A variation that returns 0 cards advances to the next.
-    Results are deduped by post URL across variations.
+    Results are deduped by permalink, or poster plus normalized-text hash when
+    no permalink is available, before any prefilter or funnel accounting.
 
     `queries` applies the same variation list to every company (with the company
     name substituted when a pattern contains ``{company}``). Prefer
     `queries_by_company` when each firm needs its own list.
     """
     matcher = matcher or HiringMatcher(mode="all")
+    if prefilter is None:
+        prefilter = "loose" if semantic_client is not None else "strict"
+    if prefilter not in {"strict", "loose"}:
+        raise ValueError("prefilter must be 'strict' or 'loose'")
     max_q = max(
         1,
         min(
@@ -2270,6 +2447,10 @@ def search_company_internship_posts(
         "junk_link": 0,
         "source_spam": 0,
         "not_first_party": 0,
+        "semantic_before": 0,
+        "semantic_kept": 0,
+        "drop_reasons": {},
+        "funnel_by_company": {},
     }
     resolver = RedirectResolver(delay=0.35, log=log)
     permalink_cache: dict[str, str] = {}
@@ -2299,10 +2480,14 @@ def search_company_internship_posts(
         totals["searched"] += 1
 
         merged: list[tuple[Post, list[str], str]] = []  # post, reasons, query
-        seen_keys: set[str] = set()
+        identity_keys: set[str] = set()
         last_search_url = ""
         company_seen = 0
         company_hiring_pass = 0
+        funnel = {
+            "seen": 0, "passed_prefilter": 0, "sent_to_gate": 0,
+            "kept_by_gate": 0, "drop_reasons": {},
+        }
 
         for q_index, query in enumerate(variations):
             log(f"  query {q_index + 1}/{len(variations)}: {query!r}")
@@ -2323,34 +2508,87 @@ def search_company_internship_posts(
                 log=log,
                 link_resolver=resolver,
                 target_company=company,
+                candidate_net=prefilter == "loose",
+                debug_funnel=debug_funnel,
+                defer_filters=True,
             )
             last_search_url = search_url or last_search_url
-            company_seen += stats.get("seen", 0)
-            totals["seen"] += stats.get("seen", 0)
-            totals["junk_link"] += stats.get("junk_link", 0)
-            totals["source_spam"] += stats.get("source_spam", 0)
+
+            # Cross-query identity dedupe happens before prefiltering, source
+            # checks, counters, link resolution, and the semantic gate.
+            raw_count = len(found)
+            unique_raw: list[Post] = []
+            found = dedupe_posts_by_identity(found, identity_keys)
+            if debug_funnel and len(found) != raw_count:
+                log(f"    funnel→dedupe: collapsed {raw_count - len(found)} repeated post(s)")
+            for post in found:
+                company_seen += 1
+                totals["seen"] += 1
+                funnel["seen"] += 1
+
+                keep, reason = _apply_filters(
+                    post, matcher, max_age_days, keep_undated,
+                    candidate_company=company if prefilter == "loose" else "",
+                )
+                if not keep:
+                    label = "too_old" if reason.startswith("older") else (
+                        "no_company_mention" if "company:none" in reason else "not_candidate"
+                    )
+                    key = f"prefilter:{label}"
+                    funnel["drop_reasons"][key] = funnel["drop_reasons"].get(key, 0) + 1
+                    if debug_funnel:
+                        log(f"    funnel→drop prefilter: {post.poster or '?'} — {reason}")
+                    continue
+
+                reject, why = _apply_link_and_source_gates(
+                    post, resolver, company=company or post.company,
+                    require_opening=prefilter != "loose",
+                )
+                if reject:
+                    label = f"source:{why}"
+                    funnel["drop_reasons"][label] = funnel["drop_reasons"].get(label, 0) + 1
+                    if why.startswith("junk-link"):
+                        totals["junk_link"] += 1
+                    else:
+                        totals["source_spam"] += 1
+                    if debug_funnel:
+                        log(f"    funnel→drop source: {post.poster or '?'} — {why}")
+                    continue
+
+                mentions = extract_funding_mentions(post.post_text)
+                if mentions:
+                    post.funding_signal = "; ".join(mentions)
+                    post._reasons.append(f"funding-in-post:{mentions[0]}")
+                post.why_matched = "; ".join(post._reasons)
+                if post.post_url and not _is_exact_post_url(post.post_url):
+                    _clear_post_url(post)
+                unique_raw.append(post)
+
+            found = unique_raw
             company_hiring_pass += len(found)
 
             if not found:
                 log("  → 0 posts; trying next broader variation…")
                 continue
 
+            strong_drops: dict[str, int] = {}
             strong_here = _strong_hits_for_company(
                 found,
                 company,
                 matcher,
                 totals,
                 strict_source=strict_source,
+                prefilter=prefilter,
                 debug_strong=debug_strong,
+                debug_funnel=debug_funnel,
+                drop_tally=strong_drops,
                 log=log,
             )
+            for reason, count in strong_drops.items():
+                funnel["drop_reasons"][reason] = funnel["drop_reasons"].get(reason, 0) + count
             added = 0
             new_strong: list[Post] = []
             for post, reasons in strong_here:
-                key = _post_dedupe_key(post)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
                 merged.append((post, reasons, query))
                 new_strong.append(post)
                 added += 1
@@ -2374,6 +2612,7 @@ def search_company_internship_posts(
             if limit_per_company is not None and len(merged) >= limit_per_company:
                 break
 
+        funnel["passed_prefilter"] = len(merged)
         for post, strong_reasons, query in merged:
             reasons: list[str] = []
             for reason in post._reasons:
@@ -2389,19 +2628,85 @@ def search_company_internship_posts(
                 {
                     "company": company,
                     "poster": post.poster,
+                    "poster_headline": post.poster_headline,
                     "snippet": make_snippet(post.post_text),
+                    # Semantic gating consumes full text; serializers ignore this
+                    # internal field because it is not in COMPANY_POST_FIELDS.
+                    "post_text": post.post_text,
                     "post_url": post.post_url,
                     "why_matched": why,
                     "source_type": post.source_type,
                     "link_class": post.link_class,
+                    "link_categories": post.link_categories,
+                    "outbound_links": post.outbound_links,
+                    "poster_employer": poster_employer_from_headline(post.poster_headline),
+                    "author_affiliation_matches_target": author_affiliation_matches_target(
+                        post.poster_headline, company
+                    ),
+                    "engagement": post.engagement,
+                    "engagement_spam_signal": _engagement_spam_signal(
+                        post.engagement, post.outbound_links
+                    ),
                     "activity_urn": post.activity_urn,
                 }
             )
             totals["strong"] += 1
+        totals["funnel_by_company"][company] = funnel
 
         log(
             f"{company}: seen {company_seen} • hiring-pass {company_hiring_pass} • "
-            f"strong {len(merged)} across {len(variations)} variation(s)"
+            f"prefilter {len(merged)} across {len(variations)} variation(s)"
         )
+
+    if semantic_client is not None and results:
+        totals["semantic_before"] = len(results)
+        for row in results:
+            totals["funnel_by_company"][row["company"]]["sent_to_gate"] += 1
+        gate_drops: dict[str, dict[str, int]] = {}
+        results = gate_company_posts_semantic(
+            semantic_client,
+            results,
+            adaptive=adaptive_gate,
+            history_path=gate_history_path,
+            drop_tally=gate_drops,
+            debug_funnel=debug_funnel,
+            log=log,
+        )
+        totals["semantic_kept"] = len(results)
+        for row in results:
+            totals["funnel_by_company"][row["company"]]["kept_by_gate"] += 1
+        for company, funnel in totals["funnel_by_company"].items():
+            funnel["drop_reasons"].update({
+                reason: funnel["drop_reasons"].get(reason, 0) + count
+                for reason, count in gate_drops.get(company, {}).items()
+            })
+            log(
+                f"funnel {company}: seen {funnel['seen']} → passed_prefilter "
+                f"{funnel['passed_prefilter']} → sent_to_gate {funnel['sent_to_gate']} "
+                f"→ kept_by_gate {funnel['kept_by_gate']}"
+            )
+            if funnel["drop_reasons"]:
+                detail = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(funnel["drop_reasons"].items())
+                )
+                log(f"funnel {company} drops: {detail}")
+    else:
+        for company, funnel in totals["funnel_by_company"].items():
+            # Keep the public funnel monotonic even when no LLM is configured:
+            # the strict deterministic prefilter is the terminal decision stage.
+            funnel["sent_to_gate"] = funnel["passed_prefilter"]
+            funnel["kept_by_gate"] = funnel["passed_prefilter"]
+            log(
+                f"funnel {company}: seen {funnel['seen']} → passed_prefilter "
+                f"{funnel['passed_prefilter']} → sent_to_gate {funnel['sent_to_gate']} "
+                f"(semantic skipped) → kept_by_gate {funnel['kept_by_gate']}"
+            )
+            if funnel["drop_reasons"]:
+                detail = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(funnel["drop_reasons"].items())
+                )
+                log(f"funnel {company} drops: {detail}")
 
     return results, totals
